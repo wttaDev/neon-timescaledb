@@ -636,3 +636,101 @@ RUN wget https://github.com/pksunkara/pgx_ulid/archive/refs/tags/v0.1.0.tar.gz -
     cargo pgx install --release && \
     echo "trusted = true" >> /usr/local/pgsql/share/extension/ulid.control
 
+#########################################################################################
+#
+# Layer "neon-pg-ext-build"
+# compile neon extensions
+#
+#########################################################################################
+FROM build-deps AS neon-pg-ext-build
+# Public extensions
+COPY --from=postgis-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=postgis-build /sfcgal/* /
+COPY --from=plv8-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=h3-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=h3-pg-build /h3/usr /
+COPY --from=unit-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=vector-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pgjwt-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-jsonschema-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-graphql-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-tiktoken-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=hypopg-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-hashids-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=rum-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pgtap-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=ip4r-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=prefix-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=hll-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=plpgsql-check-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=timescaledb-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-hint-plan-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=kq-imcx-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-cron-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-pgx-ulid-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=rdkit-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-uuidv7-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY --from=pg-roaringbitmap-pg-build /usr/local/pgsql/ /usr/local/pgsql/
+COPY pgxn/ pgxn/
+
+RUN make -j $(getconf _NPROCESSORS_ONLN) \
+        PG_CONFIG=/usr/local/pgsql/bin/pg_config \
+        -C pgxn/neon \
+        -s install && \
+    make -j $(getconf _NPROCESSORS_ONLN) \
+        PG_CONFIG=/usr/local/pgsql/bin/pg_config \
+        -C pgxn/neon_utils \
+        -s install && \
+    make -j $(getconf _NPROCESSORS_ONLN) \
+        PG_CONFIG=/usr/local/pgsql/bin/pg_config \
+        -C pgxn/hnsw \
+        -s install
+
+#########################################################################################
+#
+# Compile and run the Neon-specific `compute_ctl` binary
+#
+#########################################################################################
+FROM $REPOSITORY/$IMAGE:$TAG AS compute-tools
+ARG BUILD_TAG
+ENV BUILD_TAG=$BUILD_TAG
+
+USER nonroot
+# Copy entire project to get Cargo.* files with proper dependencies for the whole project
+COPY --chown=nonroot . .
+RUN cd compute_tools && cargo build --locked --profile release-line-debug-size-lto
+
+#########################################################################################
+#
+# Clean up postgres folder before inclusion
+#
+#########################################################################################
+FROM neon-pg-ext-build AS postgres-cleanup-layer
+COPY --from=neon-pg-ext-build /usr/local/pgsql /usr/local/pgsql
+
+# Remove binaries from /bin/ that we won't use (or would manually copy & install otherwise)
+RUN cd /usr/local/pgsql/bin && rm ecpg raster2pgsql shp2pgsql pgtopo_export pgtopo_import pgsql2shp
+
+# Remove headers that we won't need anymore - we've completed installation of all extensions
+RUN rm -r /usr/local/pgsql/include
+
+# Remove static postgresql libraries - all compilation is finished, so we
+# can now remove these files - they must be included in other binaries by now
+# if they were to be used by other libraries.
+RUN rm /usr/local/pgsql/lib/lib*.a
+
+#########################################################################################
+#
+# Extenstion only
+#
+#########################################################################################
+FROM scratch AS postgres-extensions
+# After the transition this layer will include all extensitons.
+# As for now, it's only for new custom ones
+#
+# # Default extensions
+# COPY --from=postgres-cleanup-layer /usr/local/pgsql/share/extension /usr/local/pgsql/share/extension
+# COPY --from=postgres-cleanup-layer /usr/local/pgsql/lib             /usr/local/pgsql/lib
+# Custom extensions
+COPY --from=pg-anon-pg-build /extensions/anon/lib/ /extensions/anon/lib
+COPY --from=pg-anon-pg-build /extensions/anon/share/extension /extensions/anon/share/extension
