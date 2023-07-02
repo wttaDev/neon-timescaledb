@@ -698,4 +698,22 @@ ENV BUILD_TAG=$BUILD_TAG
 USER nonroot
 # Copy entire project to get Cargo.* files with proper dependencies for the whole project
 COPY --chown=nonroot . .
-RUN cd compute_tools && cargo build --locked --profile release-line-debug-size-lto
+
+#########################################################################################
+#
+# Clean up postgres folder before inclusion
+#
+#########################################################################################
+FROM neon-pg-ext-build AS postgres-cleanup-layer
+COPY --from=neon-pg-ext-build /usr/local/pgsql /usr/local/pgsql
+
+# Remove binaries from /bin/ that we won't use (or would manually copy & install otherwise)
+RUN cd /usr/local/pgsql/bin && rm ecpg raster2pgsql shp2pgsql pgtopo_export pgtopo_import pgsql2shp
+
+# Remove headers that we won't need anymore - we've completed installation of all extensions
+RUN rm -r /usr/local/pgsql/include
+
+# Remove static postgresql libraries - all compilation is finished, so we
+# can now remove these files - they must be included in other binaries by now
+# if they were to be used by other libraries.
+RUN rm /usr/local/pgsql/lib/lib*.a
