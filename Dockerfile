@@ -752,7 +752,7 @@ RUN mkdir /var/db && useradd -m -d /var/db/postgres postgres && \
     mkdir -p -m 777 /neon/cache
 
 COPY --from=postgres-cleanup-layer --chown=postgres /usr/local/pgsql /usr/local
-# COPY --from=compute-tools --chown=postgres /home/nonroot/target/release-line-debug-size-lto/compute_ctl /usr/local/bin/compute_ctl
+COPY --from=compute-tools --chown=postgres /home/nonroot/target/release-line-debug-size-lto/compute_ctl /usr/local/bin/compute_ctl
 
 # # Install:
 # # libreadline8 for psql
