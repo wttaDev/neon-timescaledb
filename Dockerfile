@@ -732,5 +732,5 @@ FROM scratch AS postgres-extensions
 # COPY --from=postgres-cleanup-layer /usr/local/pgsql/lib             /usr/local/pgsql/lib
 # Custom extensions
 COPY --from=pg-anon-pg-build /extensions/anon/lib/ /extensions/anon/lib
-COPY --from=pg-anon-pg-build /extensions/anon/share/extension /extensions/anon/share/extension
+# COPY --from=pg-anon-pg-build /extensions/anon/share/extension /extensions/anon/share/extension
 
