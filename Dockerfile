@@ -734,3 +734,62 @@ FROM neon-pg-ext-build AS postgres-cleanup-layer
 COPY --from=pg-anon-pg-build /extensions/anon/lib/ /extensions/anon/lib
 COPY --from=pg-anon-pg-build /extensions/anon/share/extension /extensions/anon/share/extension
 
+#########################################################################################
+#
+# Final layer
+# Put it all together into the final image
+#
+#########################################################################################
+FROM debian:bullseye-slim
+# Add user postgres
+RUN mkdir /var/db && useradd -m -d /var/db/postgres postgres && \
+    echo "postgres:test_console_pass" | chpasswd && \
+    mkdir /var/db/postgres/compute && mkdir /var/db/postgres/specs && \
+    chown -R postgres:postgres /var/db/postgres && \
+    chmod 0750 /var/db/postgres/compute && \
+    echo '/usr/local/lib' >> /etc/ld.so.conf && /sbin/ldconfig && \
+    # create folder for file cache
+    mkdir -p -m 777 /neon/cache
+
+COPY --from=postgres-cleanup-layer --chown=postgres /usr/local/pgsql /usr/local
+COPY --from=compute-tools --chown=postgres /home/nonroot/target/release-line-debug-size-lto/compute_ctl /usr/local/bin/compute_ctl
+
+# Install:
+# libreadline8 for psql
+# libicu67, locales for collations (including ICU and plpgsql_check)
+# liblz4-1 for lz4
+# libossp-uuid16 for extension ossp-uuid
+# libgeos, libgdal, libsfcgal1, libproj and libprotobuf-c1 for PostGIS
+# libxml2, libxslt1.1 for xml2
+# libzstd1 for zstd
+# libboost*, libfreetype6, and zlib1g for rdkit
+RUN apt update &&  \
+    apt install --no-install-recommends -y \
+        gdb \
+        libicu67 \
+        liblz4-1 \
+        libreadline8 \
+        libboost-iostreams1.74.0 \
+        libboost-regex1.74.0 \
+        libboost-serialization1.74.0 \
+        libboost-system1.74.0 \
+        libossp-uuid16 \
+        libfreetype6 \
+        libgeos-c1v5 \
+        libgdal28 \
+        libproj19 \
+        libprotobuf-c1 \
+        libsfcgal1 \
+        libxml2 \
+        libxslt1.1 \
+        libzstd1 \
+        libcurl4-openssl-dev \
+        locales \
+        procps \
+        zlib1g && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
+    localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
+
+ENV LANG en_US.utf8
+USER postgres
+ENTRYPOINT ["/usr/local/bin/compute_ctl"]
