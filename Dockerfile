@@ -723,7 +723,7 @@ RUN rm /usr/local/pgsql/lib/lib*.a
 # Extenstion only
 #
 #########################################################################################
-FROM scratch AS postgres-extensions
+FROM neon-pg-ext-build AS postgres-cleanup-layer
 # After the transition this layer will include all extensitons.
 # As for now, it's only for new custom ones
 #
@@ -731,6 +731,6 @@ FROM scratch AS postgres-extensions
 # COPY --from=postgres-cleanup-layer /usr/local/pgsql/share/extension /usr/local/pgsql/share/extension
 # COPY --from=postgres-cleanup-layer /usr/local/pgsql/lib             /usr/local/pgsql/lib
 # Custom extensions
-# COPY --from=pg-anon-pg-build /extensions/anon/lib/ /extensions/anon/lib
-# COPY --from=pg-anon-pg-build /extensions/anon/share/extension /extensions/anon/share/extension
+COPY --from=pg-anon-pg-build /extensions/anon/lib/ /extensions/anon/lib
+COPY --from=pg-anon-pg-build /extensions/anon/share/extension /extensions/anon/share/extension
 
