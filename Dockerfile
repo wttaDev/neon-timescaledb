@@ -718,19 +718,3 @@ RUN rm -r /usr/local/pgsql/include
 # can now remove these files - they must be included in other binaries by now
 # if they were to be used by other libraries.
 RUN rm /usr/local/pgsql/lib/lib*.a
-
-#########################################################################################
-#
-# Extenstion only
-#
-#########################################################################################
-FROM scratch AS postgres-extensions
-# After the transition this layer will include all extensitons.
-# As for now, it's only for new custom ones
-#
-# # Default extensions
-# COPY --from=postgres-cleanup-layer /usr/local/pgsql/share/extension /usr/local/pgsql/share/extension
-# COPY --from=postgres-cleanup-layer /usr/local/pgsql/lib             /usr/local/pgsql/lib
-# Custom extensions
-COPY --from=pg-anon-pg-build /extensions/anon/lib/ /extensions/anon/lib
-COPY --from=pg-anon-pg-build /extensions/anon/share/extension /extensions/anon/share/extension
