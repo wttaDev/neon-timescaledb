@@ -6,23 +6,33 @@ use crate::{
     cancellation::{self, CancelMap},
     compute::{self, PostgresConnection},
     config::{ProxyConfig, TlsConfig},
-    console::{self, messages::MetricsAuxInfo},
+    console::{
+        self,
+        errors::{ApiError, WakeComputeError},
+        messages::MetricsAuxInfo,
+    },
     error::io_error,
     stream::{PqStream, Stream},
 };
 use anyhow::{bail, Context};
 use futures::TryFutureExt;
+use hyper::StatusCode;
 use metrics::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use once_cell::sync::Lazy;
 use pq_proto::{BeMessage as Be, FeStartupPacket, StartupMessageParams};
-use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use std::{error::Error, ops::ControlFlow, sync::Arc};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    time,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use utils::measured_stream::MeasuredStream;
 
 /// Number of times we should retry the `/proxy_wake_compute` http request.
-pub const NUM_RETRIES_WAKE_COMPUTE: usize = 1;
+/// Retry duration is BASE_RETRY_WAIT_DURATION * 1.5^n
+pub const NUM_RETRIES_WAKE_COMPUTE: u32 = 10;
+const BASE_RETRY_WAIT_DURATION: time::Duration = time::Duration::from_millis(100);
 
 const ERR_INSECURE_CONNECTION: &str = "connection is insecure (try using `sslmode=require`)";
 const ERR_PROTO_VIOLATION: &str = "protocol violation";
@@ -152,7 +162,10 @@ pub async fn handle_ws_client(
             .map(|_| auth::ClientCredentials::parse(&params, hostname, common_names))
             .transpose();
 
-        async { result }.or_else(|e| stream.throw_error(e)).await?
+        match result {
+            Ok(creds) => creds,
+            Err(e) => stream.throw_error(e).await?,
+        }
     };
 
     let client = Client::new(stream, creds, &params, session_id, false);
@@ -191,7 +204,10 @@ async fn handle_client(
             .map(|_| auth::ClientCredentials::parse(&params, sni, common_names))
             .transpose();
 
-        async { result }.or_else(|e| stream.throw_error(e)).await?
+        match result {
+            Ok(creds) => creds,
+            Err(e) => stream.throw_error(e).await?,
+        }
     };
 
     let allow_self_signed_compute = config.allow_self_signed_compute;
@@ -305,13 +321,13 @@ pub fn invalidate_cache(node_info: &console::CachedNodeInfo) {
 #[tracing::instrument(name = "connect_once", skip_all)]
 async fn connect_to_compute_once(
     node_info: &console::CachedNodeInfo,
+    timeout: time::Duration,
 ) -> Result<PostgresConnection, compute::ConnectionError> {
     let allow_self_signed_compute = node_info.allow_self_signed_compute;
 
     node_info
         .config
-        .connect(allow_self_signed_compute)
-        .inspect_err(|_: &compute::ConnectionError| invalidate_cache(node_info))
+        .connect(allow_self_signed_compute, timeout)
         .await
 }
 
@@ -324,28 +340,157 @@ async fn connect_to_compute(
     extra: &console::ConsoleReqExtra<'_>,
     creds: &auth::BackendType<'_, auth::ClientCredentials<'_>>,
 ) -> Result<PostgresConnection, compute::ConnectionError> {
-    let mut num_retries: usize = NUM_RETRIES_WAKE_COMPUTE;
+    let mut num_retries = 0;
+    let mut wait_duration = time::Duration::ZERO;
+    let mut should_wake_with_error = None;
     loop {
         // Apply startup params to the (possibly, cached) compute node info.
         node_info.config.set_startup_params(params);
-        match connect_to_compute_once(node_info).await {
-            Err(e) if num_retries > 0 => {
-                info!("compute node's state has changed; requesting a wake-up");
-                match creds.wake_compute(extra).map_err(io_error).await? {
-                    // Update `node_info` and try one more time.
-                    Some(mut new) => {
-                        new.config.reuse_password(&node_info.config);
-                        *node_info = new;
-                    }
-                    // Link auth doesn't work that way, so we just exit.
-                    None => return Err(e),
-                }
-            }
-            other => return other,
+
+        if !wait_duration.is_zero() {
+            time::sleep(wait_duration).await;
         }
 
-        num_retries -= 1;
-        info!("retrying after wake-up ({num_retries} attempts left)");
+        // try wake the compute node if we have determined it's sensible to do so
+        if let Some(err) = should_wake_with_error.take() {
+            match try_wake(node_info, extra, creds).await {
+                // we can't wake up the compute node
+                Ok(None) => return Err(err),
+                // there was an error communicating with the control plane
+                Err(e) => return Err(io_error(e).into()),
+                // failed to wake up but we can continue to retry
+                Ok(Some(ControlFlow::Continue(()))) => {
+                    wait_duration = retry_after(num_retries);
+                    should_wake_with_error = Some(err);
+
+                    num_retries += 1;
+                    info!(num_retries, "retrying wake compute");
+                    continue;
+                }
+                // successfully woke up a compute node and can break the wakeup loop
+                Ok(Some(ControlFlow::Break(()))) => {}
+            }
+        }
+
+        // Set a shorter timeout for the initial connection attempt.
+        //
+        // In case we try to connect to an outdated address that is no longer valid, the
+        // default behavior of Kubernetes is to drop the packets, causing us to wait for
+        // the entire timeout period. We want to fail fast in such cases.
+        //
+        // A specific case to consider is when we have cached compute node information
+        // with a 4-minute TTL (Time To Live), but the user has executed a `/suspend` API
+        // call, resulting in the nonexistence of the compute node.
+        //
+        // We only use caching in case of scram proxy backed by the console, so reduce
+        // the timeout only in that case.
+        let is_scram_proxy = matches!(creds, auth::BackendType::Console(_, _));
+        let timeout = if is_scram_proxy && num_retries == 0 {
+            time::Duration::from_secs(2)
+        } else {
+            time::Duration::from_secs(10)
+        };
+
+        // do this again to ensure we have username?
+        node_info.config.set_startup_params(params);
+
+        match connect_to_compute_once(node_info, timeout).await {
+            Ok(res) => return Ok(res),
+            Err(e) => {
+                error!(error = ?e, "could not connect to compute node");
+                if !can_retry_error(&e, num_retries) {
+                    return Err(e);
+                }
+                wait_duration = retry_after(num_retries);
+
+                // after the first connect failure,
+                // we should invalidate the cache and wake up a new compute node
+                if num_retries == 0 {
+                    invalidate_cache(node_info);
+                    should_wake_with_error = Some(e);
+                }
+            }
+        }
+
+        num_retries += 1;
+        info!(num_retries, "retrying connect");
+    }
+}
+
+/// Attempts to wake up the compute node.
+/// * Returns Ok(Some(true)) if there was an error waking but retries are acceptable
+/// * Returns Ok(Some(false)) if the wakeup succeeded
+/// * Returns Ok(None) or Err(e) if there was an error
+pub async fn try_wake(
+    node_info: &mut console::CachedNodeInfo,
+    extra: &console::ConsoleReqExtra<'_>,
+    creds: &auth::BackendType<'_, auth::ClientCredentials<'_>>,
+) -> Result<Option<ControlFlow<()>>, WakeComputeError> {
+    info!("compute node's state has likely changed; requesting a wake-up");
+    match creds.wake_compute(extra).await {
+        // retry wake if the compute was in an invalid state
+        Err(WakeComputeError::ApiError(ApiError::Console {
+            status: StatusCode::BAD_REQUEST,
+            ..
+        })) => Ok(Some(ControlFlow::Continue(()))),
+        // Update `node_info` and try again.
+        Ok(Some(mut new)) => {
+            new.config.reuse_password(&node_info.config);
+            *node_info = new;
+            Ok(Some(ControlFlow::Break(())))
+        }
+        Err(e) => Err(e),
+        Ok(None) => Ok(None),
+    }
+}
+
+fn can_retry_error(err: &compute::ConnectionError, num_retries: u32) -> bool {
+    match err {
+        // retry all errors at least once
+        _ if num_retries == 0 => true,
+        _ if num_retries >= NUM_RETRIES_WAKE_COMPUTE => false,
+        compute::ConnectionError::Postgres(err) => can_retry_tokio_postgres_error(err),
+        compute::ConnectionError::CouldNotConnect(err) => is_io_connection_err(err),
+        _ => false,
+    }
+}
+
+pub fn can_retry_tokio_postgres_error(err: &tokio_postgres::Error) -> bool {
+    if let Some(io_err) = err.source().and_then(|x| x.downcast_ref()) {
+        is_io_connection_err(io_err)
+    } else if let Some(db_err) = err.source().and_then(|x| x.downcast_ref()) {
+        is_sql_connection_err(db_err)
+    } else {
+        false
+    }
+}
+
+fn is_sql_connection_err(err: &tokio_postgres::error::DbError) -> bool {
+    use tokio_postgres::error::SqlState;
+    matches!(
+        err.code(),
+        &SqlState::CONNECTION_FAILURE
+            | &SqlState::CONNECTION_EXCEPTION
+            | &SqlState::CONNECTION_DOES_NOT_EXIST
+            | &SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+    )
+}
+
+fn is_io_connection_err(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable | ErrorKind::TimedOut
+    )
+}
+
+pub fn retry_after(num_retries: u32) -> time::Duration {
+    match num_retries {
+        0 => time::Duration::ZERO,
+        _ => {
+            // 3/2 = 1.5 which seems to be an ok growth factor heuristic
+            BASE_RETRY_WAIT_DURATION * 3_u32.pow(num_retries) / 2_u32.pow(num_retries)
+        }
     }
 }
 
@@ -477,15 +622,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<'_, S> {
             application_name: params.get("application_name"),
         };
 
-        let auth_result = async {
-            // `&mut stream` doesn't let us merge those 2 lines.
-            let res = creds
-                .authenticate(&extra, &mut stream, allow_cleartext)
-                .await;
-
-            async { res }.or_else(|e| stream.throw_error(e)).await
-        }
-        .await?;
+        let auth_result = match creds
+            .authenticate(&extra, &mut stream, allow_cleartext)
+            .await
+        {
+            Ok(auth_result) => auth_result,
+            Err(e) => return stream.throw_error(e).await,
+        };
 
         let AuthSuccess {
             reported_auth_ok,

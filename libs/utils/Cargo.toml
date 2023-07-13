@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-atty.workspace = true
 sentry.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
@@ -40,6 +39,8 @@ uuid.workspace = true
 pq_proto.workspace = true
 metrics.workspace = true
 workspace_hack.workspace = true
+
+const_format.workspace = true
 
 [dev-dependencies]
 byteorder.workspace = true

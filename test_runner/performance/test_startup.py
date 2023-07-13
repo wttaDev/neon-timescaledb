@@ -52,12 +52,18 @@ def test_startup_simple(neon_env_builder: NeonEnvBuilder, zenbenchmark: NeonBenc
             "wait_for_spec_ms": f"{i}_wait_for_spec",
             "sync_safekeepers_ms": f"{i}_sync_safekeepers",
             "basebackup_ms": f"{i}_basebackup",
+            "start_postgres_ms": f"{i}_start_postgres",
             "config_ms": f"{i}_config",
             "total_startup_ms": f"{i}_total_startup",
         }
         for key, name in durations.items():
             value = metrics[key]
             zenbenchmark.record(name, value, "ms", report=MetricReport.LOWER_IS_BETTER)
+
+        # Check basebackup size makes sense
+        basebackup_bytes = metrics["basebackup_bytes"]
+        if i > 0:
+            assert basebackup_bytes < 100 * 1024
 
         # Stop so we can restart
         endpoint.stop()

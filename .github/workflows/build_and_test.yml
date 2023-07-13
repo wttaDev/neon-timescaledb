@@ -155,7 +155,7 @@ jobs:
         build_type: [ debug, release ]
     env:
       BUILD_TYPE: ${{ matrix.build_type }}
-      GIT_VERSION: ${{ github.sha }}
+      GIT_VERSION: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
       - name: Fix git ownership
@@ -173,6 +173,27 @@ jobs:
         with:
           submodules: true
           fetch-depth: 1
+
+      - name: Check Postgres submodules revision
+        shell: bash -euo pipefail {0}
+        run: |
+          # This is a temporary solution to ensure that the Postgres submodules revision is correct (i.e. the updated intentionally).
+          # Eventually it will be replaced by a regression test https://github.com/neondatabase/neon/pull/4603
+
+          FAILED=false
+          for postgres in postgres-v14 postgres-v15; do
+            expected=$(cat vendor/revisions.json | jq --raw-output '."'"${postgres}"'"')
+            actual=$(git rev-parse "HEAD:vendor/${postgres}")
+            if [ "${expected}" != "${actual}" ]; then
+              echo >&2 "Expected ${postgres} rev to be at '${expected}', but it is at '${actual}'"
+              FAILED=true
+            fi
+          done
+
+          if [ "${FAILED}" = "true" ]; then
+            echo >&2 "Please update vendors/revisions.json if these changes are intentional"
+            exit 1
+          fi
 
       - name: Set pg 14 revision for caching
         id: pg_v14_rev
@@ -614,7 +635,7 @@ jobs:
           /kaniko/executor --reproducible --snapshot-mode=redo --skip-unused-stages --cache=true
                            --cache-repo 369495373322.dkr.ecr.eu-central-1.amazonaws.com/cache
                            --context .
-                           --build-arg GIT_VERSION=${{ github.sha }}
+                           --build-arg GIT_VERSION=${{ github.event.pull_request.head.sha || github.sha }}
                            --build-arg REPOSITORY=369495373322.dkr.ecr.eu-central-1.amazonaws.com
                            --destination 369495373322.dkr.ecr.eu-central-1.amazonaws.com/neon:${{needs.tag.outputs.build-tag}}
                            --destination neondatabase/neon:${{needs.tag.outputs.build-tag}}
@@ -658,7 +679,7 @@ jobs:
           /kaniko/executor --reproducible --snapshot-mode=redo --skip-unused-stages --cache=true
                            --cache-repo 369495373322.dkr.ecr.eu-central-1.amazonaws.com/cache
                            --context .
-                           --build-arg GIT_VERSION=${{ github.sha }}
+                           --build-arg GIT_VERSION=${{ github.event.pull_request.head.sha || github.sha }}
                            --build-arg BUILD_TAG=${{needs.tag.outputs.build-tag}}
                            --build-arg REPOSITORY=369495373322.dkr.ecr.eu-central-1.amazonaws.com
                            --dockerfile Dockerfile.compute-tools
@@ -715,7 +736,7 @@ jobs:
           /kaniko/executor --reproducible --snapshot-mode=redo --skip-unused-stages --cache=true
                            --cache-repo 369495373322.dkr.ecr.eu-central-1.amazonaws.com/cache
                            --context .
-                           --build-arg GIT_VERSION=${{ github.sha }}
+                           --build-arg GIT_VERSION=${{ github.event.pull_request.head.sha || github.sha }}
                            --build-arg PG_VERSION=${{ matrix.version }}
                            --build-arg BUILD_TAG=${{needs.tag.outputs.build-tag}}
                            --build-arg REPOSITORY=369495373322.dkr.ecr.eu-central-1.amazonaws.com
@@ -742,7 +763,7 @@ jobs:
           /kaniko/executor --reproducible --snapshot-mode=redo --skip-unused-stages --cache=true \
                            --cache-repo 369495373322.dkr.ecr.eu-central-1.amazonaws.com/cache \
                            --context . \
-                           --build-arg GIT_VERSION=${{ github.sha }} \
+                           --build-arg GIT_VERSION=${{ github.event.pull_request.head.sha || github.sha }} \
                            --build-arg PG_VERSION=${{ matrix.version }} \
                            --build-arg BUILD_TAG=${{needs.tag.outputs.build-tag}} \
                            --build-arg REPOSITORY=369495373322.dkr.ecr.eu-central-1.amazonaws.com \
@@ -767,7 +788,7 @@ jobs:
       run:
         shell: sh -eu {0}
     env:
-      VM_BUILDER_VERSION: v0.11.0
+      VM_BUILDER_VERSION: v0.12.1
 
     steps:
       - name: Checkout
@@ -966,6 +987,10 @@ jobs:
           # Delete Neon extensitons (they always present on compute-node image)
           rm -rf ./extensions-to-upload/share/extension/neon*
           rm -rf ./extensions-to-upload/lib/neon*
+
+          # Delete leftovers from the extension build step
+          rm -rf ./extensions-to-upload/lib/pgxs
+          rm -rf ./extensions-to-upload/lib/pkgconfig
 
           docker cp ${{ steps.create-container.outputs.EID }}:/extensions ./custom-extensions
           for EXT_NAME in $(ls ./custom-extensions); do
